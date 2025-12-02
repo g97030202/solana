@@ -2469,6 +2469,105 @@ impl PoolFinder {
             );
         }
     }
+
+    /// Display comprehensive pool validation summary
+    pub fn display_validation_summary(pools: &[ValidatedPool]) {
+        if pools.is_empty() {
+            println!("\n[PoolFinder] No pools to display");
+            return;
+        }
+
+        println!("\n");
+        println!("                    POOL VALIDATION SUMMARY                      ");
+        println!("");
+        
+        let active_count = pools.iter().filter(|p| p.is_active).count();
+        let valid_for_sub = pools.iter().filter(|p| p.is_valid_for_subscription()).count();
+        let avg_quality: f64 = pools.iter().map(|p| p.quality_score).sum::<f64>() / pools.len() as f64;
+        let total_liquidity: f64 = pools.iter().map(|p| p.liquidity_usd).sum();
+        
+        println!("  Total Pools:        {}", pools.len());
+        println!("  Active Pools:       {} ({:.0}%)", active_count, (active_count as f64 / pools.len() as f64) * 100.0);
+        println!("  Valid for Sub:      {} ({:.0}%)", valid_for_sub, (valid_for_sub as f64 / pools.len() as f64) * 100.0);
+        println!("  Avg Quality Score:  {:.2}", avg_quality);
+        println!("  Total Liquidity:    ${:.0}", total_liquidity);
+        println!("");
+        
+        println!("  {:<20} {:<14} {:<10} {:<8} {:<10}", "DEX", "Address", "Liquidity", "Quality", "Status");
+        println!("  {}", "-".repeat(66));
+        
+        for pool in pools.iter().take(15) {
+            let status = if pool.is_valid_for_subscription() {
+                "Ready"
+            } else if pool.is_active {
+                "Active"
+            } else if pool.consecutive_failures > 0 {
+                "Failing"
+            } else {
+                "Inactive"
+            };
+            
+            println!("  {:<20} {}... ${:<9.0} {:<8.2} {}",
+                &pool.dex_name[..20.min(pool.dex_name.len())],
+                &pool.address[..10.min(pool.address.len())],
+                pool.liquidity_usd,
+                pool.quality_score,
+                status,
+            );
+        }
+        
+        if pools.len() > 15 {
+            println!("  ... and {} more pools", pools.len() - 15);
+        }
+        
+        println!("");
+    }
+
+    /// Get statistics about pool health
+    pub fn get_pool_statistics(pools: &[ValidatedPool]) -> PoolStatistics {
+        let total = pools.len();
+        let active = pools.iter().filter(|p| p.is_active).count();
+        let valid_for_subscription = pools.iter().filter(|p| p.is_valid_for_subscription()).count();
+        let with_failures = pools.iter().filter(|p| p.consecutive_failures > 0).count();
+        let avg_quality = if total > 0 {
+            pools.iter().map(|p| p.quality_score).sum::<f64>() / total as f64
+        } else {
+            0.0
+        };
+        let total_liquidity = pools.iter().map(|p| p.liquidity_usd).sum();
+
+        PoolStatistics {
+            total_pools: total,
+            active_pools: active,
+            valid_for_subscription,
+            pools_with_failures: with_failures,
+            average_quality_score: avg_quality,
+            total_liquidity_usd: total_liquidity,
+        }
+    }
+}
+
+/// Statistics about pool health and status
+#[derive(Debug, Clone)]
+pub struct PoolStatistics {
+    pub total_pools: usize,
+    pub active_pools: usize,
+    pub valid_for_subscription: usize,
+    pub pools_with_failures: usize,
+    pub average_quality_score: f64,
+    pub total_liquidity_usd: f64,
+}
+
+impl std::fmt::Display for PoolStatistics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pools: {}/{} active, {} valid for sub, avg quality: {:.2}, liquidity: ${:.0}",
+            self.active_pools,
+            self.total_pools,
+            self.valid_for_subscription,
+            self.average_quality_score,
+            self.total_liquidity_usd
+        )
+    }
 }
 
 /// Helper function to integrate PoolFinder with existing Options 3 & 4
@@ -2487,6 +2586,229 @@ pub async fn discover_and_validate_pools(
     let pools = finder.find_pools_for_pair(token_a, token_b).await?;
     
     Ok(PoolFinder::get_subscription_list(&pools))
+}
+
+// ============================================================================
+// --- POOL FINDER UNIT TESTS ---
+// ============================================================================
+
+#[cfg(test)]
+mod pool_finder_tests {
+    use super::*;
+
+    #[test]
+    fn test_dex_type_from_program_id() {
+        assert_eq!(
+            DexType::from_program_id("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"),
+            DexType::RaydiumAmmV4
+        );
+        assert_eq!(
+            DexType::from_program_id("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"),
+            DexType::OrcaWhirlpool
+        );
+        assert_eq!(
+            DexType::from_program_id("LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"),
+            DexType::MeteoraDlmm
+        );
+        assert_eq!(
+            DexType::from_program_id("unknown_program_id"),
+            DexType::Unknown
+        );
+    }
+
+    #[test]
+    fn test_dex_type_from_dex_name() {
+        assert_eq!(DexType::from_dex_name("Raydium AMM V4"), DexType::RaydiumAmmV4);
+        assert_eq!(DexType::from_dex_name("raydium clmm"), DexType::RaydiumClmm);
+        assert_eq!(DexType::from_dex_name("Orca Whirlpool"), DexType::OrcaWhirlpool);
+        assert_eq!(DexType::from_dex_name("Meteora DLMM"), DexType::MeteoraDlmm);
+        assert_eq!(DexType::from_dex_name("pumpswap"), DexType::PumpSwap);
+        assert_eq!(DexType::from_dex_name("some unknown dex"), DexType::Unknown);
+    }
+
+    #[test]
+    fn test_dex_type_display_name() {
+        assert_eq!(DexType::RaydiumAmmV4.display_name(), "Raydium AMM V4");
+        assert_eq!(DexType::OrcaWhirlpool.display_name(), "Orca Whirlpool");
+        assert_eq!(DexType::MeteoraDlmm.display_name(), "Meteora DLMM");
+    }
+
+    #[test]
+    fn test_validated_pool_new() {
+        let pool = ValidatedPool::new(
+            "test_address_123",
+            DexType::RaydiumAmmV4,
+            SOL_MINT,
+            USDC_MINT,
+        );
+        
+        assert_eq!(pool.address, "test_address_123");
+        assert_eq!(pool.dex_type, DexType::RaydiumAmmV4);
+        assert_eq!(pool.token_a_mint, SOL_MINT);
+        assert_eq!(pool.token_b_mint, USDC_MINT);
+        assert_eq!(pool.reserve_a, 0);
+        assert_eq!(pool.reserve_b, 0);
+        assert!(!pool.is_active);
+        assert_eq!(pool.quality_score, 0.0);
+    }
+
+    #[test]
+    fn test_validated_pool_is_valid_for_subscription() {
+        let mut pool = ValidatedPool::new(
+            "test_address",
+            DexType::RaydiumAmmV4,
+            SOL_MINT,
+            USDC_MINT,
+        );
+        
+        // Initially not valid (no reserves, not active)
+        assert!(!pool.is_valid_for_subscription());
+        
+        // Set as active with reserves and quality score
+        pool.is_active = true;
+        pool.reserve_a = 1_000_000_000;
+        pool.reserve_b = 100_000_000;
+        pool.quality_score = 0.5;
+        
+        // Now should be valid
+        assert!(pool.is_valid_for_subscription());
+        
+        // Too many failures - not valid
+        pool.consecutive_failures = 5;
+        assert!(!pool.is_valid_for_subscription());
+    }
+
+    #[test]
+    fn test_pool_validation_config_default() {
+        let config = PoolValidationConfig::default();
+        
+        assert_eq!(config.min_reserve_threshold, 1_000_000);
+        assert_eq!(config.min_liquidity_usd, 10_000.0);
+        assert_eq!(config.max_consecutive_failures, 3);
+        assert_eq!(config.max_price_deviation_percent, 50.0);
+        assert_eq!(config.min_quality_score, 0.1);
+    }
+
+    #[test]
+    fn test_quality_score_calculation() {
+        // Create a mock RPC client - we won't actually use it for this test
+        let rpc = Arc::new(AsyncRpcClient::new("http://localhost:8899".to_string()));
+        let finder = PoolFinder::new(rpc);
+        
+        // Test low liquidity pool
+        let mut pool = ValidatedPool::new("test", DexType::Unknown, SOL_MINT, USDC_MINT);
+        pool.liquidity_usd = 5_000.0;
+        pool.is_active = false;
+        let score = finder.calculate_quality_score(&pool);
+        assert!(score < 0.3); // Low score for inactive, low liquidity, unknown DEX
+        
+        // Test high liquidity active pool on established DEX
+        let mut pool2 = ValidatedPool::new("test2", DexType::RaydiumAmmV4, SOL_MINT, USDC_MINT);
+        pool2.liquidity_usd = 2_000_000.0;
+        pool2.is_active = true;
+        pool2.reserve_a = 10_000_000_000;
+        pool2.reserve_b = 1_000_000_000;
+        let score2 = finder.calculate_quality_score(&pool2);
+        assert!(score2 > 0.7); // High score for active, high liquidity, established DEX
+    }
+
+    #[test]
+    fn test_blacklist_operations() {
+        let rpc = Arc::new(AsyncRpcClient::new("http://localhost:8899".to_string()));
+        let mut finder = PoolFinder::new(rpc);
+        
+        // Initially not blacklisted
+        assert!(!finder.is_blacklisted("some_pool"));
+        
+        // Add to blacklist
+        finder.blacklist_pool("some_pool", "test reason");
+        assert!(finder.is_blacklisted("some_pool"));
+        
+        // Check blacklist entries
+        let entries = finder.get_blacklist();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].pool_address, "some_pool");
+        assert_eq!(entries[0].reason, "test reason");
+        assert!(!entries[0].auto_added);
+        
+        // Remove from blacklist
+        finder.unblacklist_pool("some_pool");
+        assert!(!finder.is_blacklisted("some_pool"));
+    }
+
+    #[test]
+    fn test_known_bad_pools_blacklisted() {
+        let rpc = Arc::new(AsyncRpcClient::new("http://localhost:8899".to_string()));
+        let finder = PoolFinder::new(rpc);
+        
+        // Known bad pool from problem statement should be blacklisted
+        assert!(finder.is_blacklisted("58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2"));
+    }
+
+    #[test]
+    fn test_pool_statistics() {
+        let pools = vec![
+            {
+                let mut p = ValidatedPool::new("p1", DexType::RaydiumAmmV4, SOL_MINT, USDC_MINT);
+                p.is_active = true;
+                p.reserve_a = 100;
+                p.reserve_b = 100;
+                p.quality_score = 0.8;
+                p.liquidity_usd = 100_000.0;
+                p
+            },
+            {
+                let mut p = ValidatedPool::new("p2", DexType::OrcaWhirlpool, SOL_MINT, USDC_MINT);
+                p.is_active = true;
+                p.reserve_a = 100;
+                p.reserve_b = 100;
+                p.quality_score = 0.6;
+                p.liquidity_usd = 50_000.0;
+                p
+            },
+            {
+                let mut p = ValidatedPool::new("p3", DexType::MeteoraDlmm, SOL_MINT, USDC_MINT);
+                p.is_active = false;
+                p.quality_score = 0.2;
+                p.liquidity_usd = 10_000.0;
+                p
+            },
+        ];
+        
+        let stats = PoolFinder::get_pool_statistics(&pools);
+        
+        assert_eq!(stats.total_pools, 3);
+        assert_eq!(stats.active_pools, 2);
+        assert_eq!(stats.valid_for_subscription, 2);
+        assert_eq!(stats.pools_with_failures, 0);
+        assert!((stats.average_quality_score - 0.533).abs() < 0.01);
+        assert_eq!(stats.total_liquidity_usd, 160_000.0);
+    }
+
+    #[test]
+    fn test_to_subscription_tuple() {
+        let pool = ValidatedPool {
+            address: "pool_address_123".to_string(),
+            dex_type: DexType::RaydiumAmmV4,
+            dex_name: "Raydium AMM V4".to_string(),
+            token_a_mint: SOL_MINT.to_string(),
+            token_b_mint: USDC_MINT.to_string(),
+            token_a_symbol: "SOL".to_string(),
+            token_b_symbol: "USDC".to_string(),
+            reserve_a: 1000,
+            reserve_b: 1000,
+            liquidity_usd: 100_000.0,
+            is_active: true,
+            quality_score: 0.8,
+            last_validated: 0,
+            consecutive_failures: 0,
+            last_failure_reason: None,
+        };
+        
+        let tuple = pool.to_subscription_tuple();
+        assert_eq!(tuple.0, "Raydium AMM V4");
+        assert_eq!(tuple.1, "pool_address_123");
+    }
 }
 
 
