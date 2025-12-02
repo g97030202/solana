@@ -2015,6 +2015,21 @@ pub struct PoolValidationConfig {
     pub min_quality_score: f64,
 }
 
+/// Constants for reserve balance ratio thresholds
+/// These define what constitutes "balanced" vs "unbalanced" reserves
+const RESERVE_RATIO_BALANCED_MIN: f64 = 0.001;    // 1:1000 ratio
+const RESERVE_RATIO_BALANCED_MAX: f64 = 1000.0;   // 1000:1 ratio
+const RESERVE_RATIO_ACCEPTABLE_MIN: f64 = 0.0001; // 1:10000 ratio
+const RESERVE_RATIO_ACCEPTABLE_MAX: f64 = 10000.0; // 10000:1 ratio
+
+/// Quality score components (max 1.0 total)
+const QUALITY_SCORE_LIQUIDITY_WEIGHT: f64 = 0.4;
+const QUALITY_SCORE_RESERVE_BALANCE_WEIGHT: f64 = 0.2;
+const QUALITY_SCORE_ACTIVE_WEIGHT: f64 = 0.2;
+const QUALITY_SCORE_DEX_BONUS_MAX: f64 = 0.15;
+const QUALITY_SCORE_FAILURE_PENALTY_PER_FAILURE: f64 = 0.05;
+const QUALITY_SCORE_MAX_PENALTY: f64 = 0.2;
+
 impl Default for PoolValidationConfig {
     fn default() -> Self {
         Self {
@@ -2174,50 +2189,53 @@ impl PoolFinder {
         
         // Liquidity score (0-0.4) - higher liquidity = better
         let liquidity_score = if pool.liquidity_usd > 1_000_000.0 {
-            0.4
+            QUALITY_SCORE_LIQUIDITY_WEIGHT
         } else if pool.liquidity_usd > 100_000.0 {
-            0.3
+            QUALITY_SCORE_LIQUIDITY_WEIGHT * 0.75
         } else if pool.liquidity_usd > 10_000.0 {
-            0.2
+            QUALITY_SCORE_LIQUIDITY_WEIGHT * 0.5
         } else {
-            0.1
+            QUALITY_SCORE_LIQUIDITY_WEIGHT * 0.25
         };
         score += liquidity_score;
         
         // Reserve balance score (0-0.2) - balanced reserves = better
         if pool.reserve_a > 0 && pool.reserve_b > 0 {
             let ratio = pool.reserve_a as f64 / pool.reserve_b as f64;
-            // Penalize very unbalanced pools
-            if ratio > 0.001 && ratio < 1000.0 {
-                score += 0.2;
-            } else if ratio > 0.0001 && ratio < 10000.0 {
-                score += 0.1;
+            // Penalize very unbalanced pools using defined constants
+            if ratio > RESERVE_RATIO_BALANCED_MIN && ratio < RESERVE_RATIO_BALANCED_MAX {
+                score += QUALITY_SCORE_RESERVE_BALANCE_WEIGHT;
+            } else if ratio > RESERVE_RATIO_ACCEPTABLE_MIN && ratio < RESERVE_RATIO_ACCEPTABLE_MAX {
+                score += QUALITY_SCORE_RESERVE_BALANCE_WEIGHT * 0.5;
             }
         }
         
         // Active status score (0-0.2)
         if pool.is_active {
-            score += 0.2;
+            score += QUALITY_SCORE_ACTIVE_WEIGHT;
         }
         
-        // Failure penalty (0-0.2)
-        let failure_penalty = (pool.consecutive_failures as f64 * 0.05).min(0.2);
+        // Failure penalty
+        let failure_penalty = (pool.consecutive_failures as f64 * QUALITY_SCORE_FAILURE_PENALTY_PER_FAILURE)
+            .min(QUALITY_SCORE_MAX_PENALTY);
         score = (score - failure_penalty).max(0.0);
         
-        // DEX type bonus (0-0.2) - established DEXs get bonus
+        // DEX type bonus - established DEXs get bonus
         let dex_bonus = match pool.dex_type {
-            DexType::RaydiumAmmV4 | DexType::RaydiumClmm => 0.15,
-            DexType::OrcaWhirlpool => 0.15,
-            DexType::MeteoraDlmm | DexType::MeteoraDammV2 => 0.1,
-            _ => 0.05,
+            DexType::RaydiumAmmV4 | DexType::RaydiumClmm => QUALITY_SCORE_DEX_BONUS_MAX,
+            DexType::OrcaWhirlpool => QUALITY_SCORE_DEX_BONUS_MAX,
+            DexType::MeteoraDlmm | DexType::MeteoraDammV2 => QUALITY_SCORE_DEX_BONUS_MAX * 0.67,
+            _ => QUALITY_SCORE_DEX_BONUS_MAX * 0.33,
         };
         score += dex_bonus;
         
         score.min(1.0)
     }
 
-    /// Validate a pool against all criteria
-    pub async fn validate_pool(
+    /// Validate a pool against all criteria (synchronous validation)
+    /// Note: This method mutates the pool to update quality_score, last_validated, and is_active.
+    /// Returns true if pool passes all validation checks.
+    pub fn validate_pool(
         &self,
         pool: &mut ValidatedPool,
         expected_token_a: &str,
@@ -2289,7 +2307,7 @@ impl PoolFinder {
     }
 
     /// Filter pools to only include valid ones
-    pub async fn filter_valid_pools(
+    pub fn filter_valid_pools(
         &self,
         pools: Vec<ValidatedPool>,
         expected_token_a: &str,
@@ -2298,7 +2316,7 @@ impl PoolFinder {
         let mut valid_pools = Vec::new();
         
         for mut pool in pools {
-            if self.validate_pool(&mut pool, expected_token_a, expected_token_b).await {
+            if self.validate_pool(&mut pool, expected_token_a, expected_token_b) {
                 valid_pools.push(pool);
             }
         }
@@ -2377,8 +2395,8 @@ impl PoolFinder {
 
         println!("[PoolFinder] {} pools after blacklist filtering", validated_pools.len());
 
-        // Validate each pool
-        let valid_pools = self.filter_valid_pools(validated_pools, token_a, token_b).await;
+        // Validate each pool (synchronous validation)
+        let valid_pools = self.filter_valid_pools(validated_pools, token_a, token_b);
 
         println!("[PoolFinder] {} pools passed validation", valid_pools.len());
 
@@ -2414,7 +2432,7 @@ impl PoolFinder {
             // Try to fetch and validate pool data
             match self.fetch_pool_data(pool).await {
                 Ok(()) => {
-                    if self.validate_pool(pool, token_a, token_b).await {
+                    if self.validate_pool(pool, token_a, token_b) {
                         self.record_success(pool);
                     }
                 }
@@ -2781,7 +2799,9 @@ mod pool_finder_tests {
         assert_eq!(stats.active_pools, 2);
         assert_eq!(stats.valid_for_subscription, 2);
         assert_eq!(stats.pools_with_failures, 0);
-        assert!((stats.average_quality_score - 0.533).abs() < 0.01);
+        // Calculate expected average explicitly: (0.8 + 0.6 + 0.2) / 3 = 1.6 / 3 ≈ 0.533
+        let expected_avg_quality = (0.8 + 0.6 + 0.2) / 3.0;
+        assert!((stats.average_quality_score - expected_avg_quality).abs() < 0.01);
         assert_eq!(stats.total_liquidity_usd, 160_000.0);
     }
 
